@@ -46,9 +46,9 @@ type Channel struct {
 	name      string
 	nsqd      *NSQD
 
-	backend BackendQueue
+	backend BackendQueue // 磁盘队列，当内存memoryMsgChan满时，写入硬盘队列
 
-	memoryMsgChan chan *Message
+	memoryMsgChan chan *Message // 消息优先存入这个内存chan
 	exitFlag      int32
 	exitMutex     sync.RWMutex
 
@@ -63,11 +63,11 @@ type Channel struct {
 	e2eProcessingLatencyStream *quantile.Quantile
 
 	// TODO: these can be DRYd up
-	deferredMessages map[MessageID]*pqueue.Item
-	deferredPQ       pqueue.PriorityQueue
+	deferredMessages map[MessageID]*pqueue.Item // 保存尚未到时间的延迟消费消息
+	deferredPQ       pqueue.PriorityQueue       // 保存尚未到时间的延迟消费消息，最小堆
 	deferredMutex    sync.Mutex
-	inFlightMessages map[MessageID]*Message
-	inFlightPQ       inFlightPqueue
+	inFlightMessages map[MessageID]*Message // 保存已推送尚未收到FIN的消息
+	inFlightPQ       inFlightPqueue         // 保存已推送尚未收到FIN的消息，最小堆
 	inFlightMutex    sync.Mutex
 }
 
@@ -287,6 +287,9 @@ func (c *Channel) IsPaused() bool {
 	return atomic.LoadInt32(&c.paused) == 1
 }
 
+/*
+ 将消息写入channel，逻辑与topic的一致，内存未满则优先写内存chan，否则写入磁盘队列
+*/
 // PutMessage writes a Message to the queue
 func (c *Channel) PutMessage(m *Message) error {
 	c.exitMutex.RLock()
@@ -443,11 +446,16 @@ func (c *Channel) RemoveClient(clientID int64) {
 	}
 }
 
+// 消费超时相关
+/**
+channel.StartInFlightTimeout()将消息保存到channel的inFlightMessages和inFlightPQ队列中，这两个缓存是用来处理消费超时的。
+值得注意的一个小细节是c.addToInFlightPQ(msg)将msg压入最小堆时，将msg在数组的偏移量保存到了msg.index成员中（最小堆底层是数组实现）
+*/
 func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout time.Duration) error {
 	now := time.Now()
 	msg.clientID = clientID
 	msg.deliveryTS = now
-	msg.pri = now.Add(timeout).UnixNano()
+	msg.pri = now.Add(timeout).UnixNano() // pri成员保存本消息超时时间
 	err := c.pushInFlightMessage(msg)
 	if err != nil {
 		return err
@@ -456,6 +464,7 @@ func (c *Channel) StartInFlightTimeout(msg *Message, clientID int64, timeout tim
 	return nil
 }
 
+// 延时消费相关
 func (c *Channel) StartDeferredTimeout(msg *Message, timeout time.Duration) error {
 	absTs := time.Now().Add(timeout).UnixNano()
 	item := &pqueue.Item{Value: msg, Priority: absTs}
@@ -578,6 +587,13 @@ exit:
 	return dirty
 }
 
+/**
+前面提到msg.pri成员保存本消息超时时间，所以PeekAndShift()返回的是最小堆里已经超时且超时时间最长的那条消息。
+processInFlightQueue()则将消息从超时队列中删，同时将消息重新put进channel。注意此时超时的消息put进channel后实际是排在队尾的，消费顺序将发生改变。
+processInFlightQueue()方法如果存在超时消息，返回值dirty标识true。
+queueScanWorker()将dirty写入responseCh。再往回看，queueScanLoop()方法统计了dirty的数量，
+超过一定比例会继续执行loop，而不是等待下一次定时执行。
+*/
 func (c *Channel) processInFlightQueue(t int64) bool {
 	c.exitMutex.RLock()
 	defer c.exitMutex.RUnlock()

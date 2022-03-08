@@ -15,15 +15,15 @@ import (
 
 type Topic struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
-	messageCount uint64
-	messageBytes uint64
+	messageCount uint64 // 累计消息数
+	messageBytes uint64 // 累计消息体的字节数
 
 	sync.RWMutex
 
-	name              string
-	channelMap        map[string]*Channel
-	backend           BackendQueue
-	memoryMsgChan     chan *Message
+	name              string              // topic名，生产和消费时需要指定此名称
+	channelMap        map[string]*Channel // 保存每个channel name和channel指针的映射
+	backend           BackendQueue        // 磁盘队列，当内存memoryMsgChan满时，写入硬盘队列
+	memoryMsgChan     chan *Message       // 消息优先存入这个内存chan
 	startChan         chan int
 	exitChan          chan int
 	channelUpdateChan chan int
@@ -180,6 +180,11 @@ func (t *Topic) DeleteExistingChannel(channelName string) error {
 	return nil
 }
 
+/*
+	下面两个方法负责将消息写入topic，底层均调用topic.put()方法
+	1. topic.memoryMsgChan未满时，优先写入内存memoryMsgChan
+	2. 否则，写入磁盘topic.backend
+*/
 // PutMessage writes a Message to the queue
 func (t *Topic) PutMessage(m *Message) error {
 	t.RLock()
@@ -221,10 +226,15 @@ func (t *Topic) PutMessages(msgs []*Message) error {
 	return nil
 }
 
+/**
+生产者pub消息时，消息会首先写入对应topic的队列（内存优先，内存满了写磁盘），topic的messagePump()方法再将消息拷贝给每个channel。
+每个channel均各执一份完整的消息。
+消息生产由生产者调用PUB/MPUB/DPUB这类指令实现，底层都是调用topic.PutMessage(msg)，进一步调用topic.put(msg)：
+*/
 func (t *Topic) put(m *Message) error {
 	select {
-	case t.memoryMsgChan <- m:
-	default:
+	case t.memoryMsgChan <- m: // 优先写入内存memoryMsgChan
+	default: // 当内存case失败即memoryMsgChan满时，走default，将msg以字节形式写入磁盘队列topic.backend
 		err := writeMessageToBackend(m, t.backend)
 		t.nsqd.SetHealth(err)
 		if err != nil {
@@ -243,6 +253,15 @@ func (t *Topic) Depth() int64 {
 
 // messagePump selects over the in-memory and backend queue and
 // writes messages to every channel for this topic
+//topic将消息复制给每个channel
+/**
+topic.messagePump()方法代码还蛮长的，前面是些准备工作，主要就是后面的for循环。其中for循环中select的前两项，
+memoryMsgChan来源于topic.memoryMsgChan，而backendChan则是topic.backend.ReadChan()，分别对应于内存和磁盘队列。
+注意只有这两个case会往下传递消息，其他的case处理退出和更新机制的，会continue或exit外层的for循环。
+虽然通道channel是有序的，但select的case具有随机性，这就决定了每轮循环读的是内存还是磁盘是随机的，消息的消费顺序是不可控的。
+select语句获取的消息，交给第2层for循环处理，逻辑比较简单，遍历每一个chan，调用channel.PutMessage()写入。
+由于每个channel对应于不同的消费者，有不同的延时/超时和消费机制，所以这里拷贝了message实例。
+**/
 func (t *Topic) messagePump() {
 	var msg *Message
 	var buf []byte
@@ -250,7 +269,8 @@ func (t *Topic) messagePump() {
 	var chans []*Channel
 	var memoryMsgChan chan *Message
 	var backendChan <-chan []byte
-
+	/* 准备工作有代码我们略过 */
+	// 主消息处理循环
 	// do not pass messages before Start(), but avoid blocking Pause() or GetChannel()
 	for {
 		select {
@@ -314,6 +334,7 @@ func (t *Topic) messagePump() {
 
 		for i, channel := range chans {
 			chanMsg := msg
+			/* channel消费消息时，需要处理延时/超时等问题，所以这里复制了消息，给每个channel传递的是独立的消息实例 */
 			// copy the message because each channel
 			// needs a unique instance but...
 			// fastpath to avoid copy if its the first channel

@@ -19,7 +19,7 @@ type httpServer struct {
 
 func newHTTPServer(l *NSQLookupd) *httpServer {
 	log := http_api.Log(l.logf)
-
+	//d. 分别处理 tcp/http 请求，开启 handler 协程进行并发处理，其中 newHTTPServer 注册路由采用了 Decorate 装饰器模式（后面会进一步解析）；
 	router := httprouter.New()
 	router.HandleMethodNotAllowed = true
 	router.PanicHandler = http_api.LogPanicHandler(l.logf)

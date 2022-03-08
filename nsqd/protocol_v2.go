@@ -29,6 +29,8 @@ var separatorBytes = []byte(" ")
 var heartbeatBytes = []byte("_heartbeat_")
 var okBytes = []byte("OK")
 
+//nsqd/protocol_v2.go文件，protocolV2负责处理过来的具体的用户请求。
+//每个连接均会创建一个独立的protocolV2实例（由tcpServer.Handle()创建）
 type protocolV2 struct {
 	nsqd *NSQD
 }
@@ -38,6 +40,11 @@ func (p *protocolV2) NewClient(conn net.Conn) protocol.Client {
 	return newClientV2(clientID, conn, p.nsqd)
 }
 
+/*
+	tcpServer.Handle()阻塞调用本方法
+	1. 启用一个独立协程向消费者推送消息protocolV2.messagePump()
+	2. for循环接收并处理客户端请求protocolV2.Exec()
+*/
 func (p *protocolV2) IOLoop(c protocol.Client) error {
 	var err error
 	var line []byte
@@ -79,6 +86,7 @@ func (p *protocolV2) IOLoop(c protocol.Client) error {
 		if len(line) > 0 && line[len(line)-1] == '\r' {
 			line = line[:len(line)-1]
 		}
+		//f. 通过内部协议进行 p.Exec （执行命令）、 p.Send （发送结果），保证每个 nsqd 节点都能正确的进行消息生成与消费，一旦上述过程有 error 都会被捕获处理，确保分布式投递的可靠性；
 		params := bytes.Split(line, separatorBytes)
 
 		p.nsqd.logf(LOG_DEBUG, "PROTOCOL(V2): [%s] %s", client, params)
@@ -123,6 +131,7 @@ func (p *protocolV2) IOLoop(c protocol.Client) error {
 	return err
 }
 
+// 组装消息并调用protocolV2.Send()发送给消费者
 func (p *protocolV2) SendMessage(client *clientV2, msg *Message) error {
 	p.nsqd.logf(LOG_DEBUG, "PROTOCOL(V2): writing msg(%s) to client(%s) - %s", msg.ID, client, msg.Body)
 
@@ -142,6 +151,7 @@ func (p *protocolV2) SendMessage(client *clientV2, msg *Message) error {
 	return nil
 }
 
+// 向客户端发送数据帧
 func (p *protocolV2) Send(client *clientV2, frameType int32, data []byte) error {
 	client.writeLock.Lock()
 
@@ -167,6 +177,7 @@ func (p *protocolV2) Send(client *clientV2, frameType int32, data []byte) error 
 	return err
 }
 
+// 解析客户端请求的指令，调用对应的指令方法
 func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
 	if bytes.Equal(params[0], []byte("IDENTIFY")) {
 		return p.IDENTIFY(client, params)
@@ -202,6 +213,26 @@ func (p *protocolV2) Exec(client *clientV2, params [][]byte) ([]byte, error) {
 	return nil, protocol.NewFatalClientErr(nil, "E_INVALID", fmt.Sprintf("invalid command %s", params[0]))
 }
 
+// 负责向消费者推送消息
+/**
+每个连接均会启动一个运行protocolV2.messagePump()方法的协程，这个协程负责监听channel的消息队列并向客户端推送消息。
+客户端只有触发SUB指令之后，才会将channel传递给protocolV2.messagePump()，这之后消费推送才会正式开启。
+启动消息推送
+前面讲Tcpserver时有提到，客户端创建连接时，会调用tcpserver.Handle()，里面再调用protocolV2.IOLoop()。
+protocolV2.IOLoop()方法开头有下面这行：
+	go p.messagePump(client, messagePumpStartedChan)
+这行创建了一个独立线程，调用的protocolV2.messagePump()负责向消费者推送消息。
+有个小细节是无论是生产者还是消费者，都会创建这个协程，protocolV2.messagePump()创建后并不会立即推送消息，
+而是需要调用SUB指令，以protocolV2.SUB()方法为例，方法末尾有这么一行：
+	client.SubEventChan <- channel
+将当前消费者订阅的channel传入client.SubEventChan，这个会由protocolV2.messagePump()接收，
+这个方法核心是下面这个for循环
+
+客户端建立连接初始，subChannel为空，循环一直走第1个if语句。直到客户端调用SUB指令，select语句执行"case subChannel = <-subEventChan:"，此时subChannel非空，接下来backendMsgChan和memoryMsgChan被赋值，此后开始推送消息：
+
+消息会随机从内存和磁盘队列取，因为如果内存和磁盘都有数据，select是随机的
+消息通过protocolV2.SendMessage()推送给消费者
+*/
 func (p *protocolV2) messagePump(client *clientV2, startedChan chan bool) {
 	var err error
 	var memoryMsgChan chan *Message
@@ -348,6 +379,7 @@ exit:
 	}
 }
 
+// 下面多组方法是NSQD支持的指令对应的处理方法
 func (p *protocolV2) IDENTIFY(client *clientV2, params [][]byte) ([]byte, error) {
 	var err error
 
@@ -582,6 +614,14 @@ func (p *protocolV2) CheckAuth(client *clientV2, cmd, topicName, channelName str
 	return nil
 }
 
+/**
+SUB方法包含多种逻辑：
+
+当channel不存在时，topic.GetChannel()方法自动创建并与这个消费者绑定
+当channel存在，比如事先通过http-api创建好了，但没有消费者订阅，则当前消费者独立绑定这个channel
+当channel存在，且已经有消费者订阅了，topic.GetChannel()方法依然会返回这个channel，这时就有多个消费者同时订阅了这个channel，大家共用一个通道chan变量
+由于是多个消费者共用一个通道chan变量，每个消费者都有一个for select在循环监听这个通道，根据chan变量的特性，消费会随机发送给一位消费者，且一条消息只会推送给一个消费者。
+*/
 func (p *protocolV2) SUB(client *clientV2, params [][]byte) ([]byte, error) {
 	if atomic.LoadInt32(&client.State) != stateInit {
 		return nil, protocol.NewFatalClientErr(nil, "E_INVALID", "cannot SUB in current state")
@@ -677,6 +717,12 @@ func (p *protocolV2) RDY(client *clientV2, params [][]byte) ([]byte, error) {
 	return nil, nil
 }
 
+/**
+FIN的动作比较简单，主要就是调用channel.FinishMessage()方法把上面写入超时缓存的msg给删除掉。
+
+FIN从inFlightMessages中删除消息比较容易，这是个map，key是msg.id。客户端发送FIN消息时附带了msg.id。但如何从最小堆inFlightPQ中删除对应的msg呢？
+前面提到在入堆时的一个细节，即保存了msg的偏移量，此时正好用上。通过msg.index直接定位到msg的位置并调整堆即可。
+*/
 func (p *protocolV2) FIN(client *clientV2, params [][]byte) ([]byte, error) {
 	state := atomic.LoadInt32(&client.State)
 	if state != stateSubscribed && state != stateClosing {

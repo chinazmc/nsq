@@ -120,6 +120,8 @@ func (s ClientV2Stats) String() string {
 	)
 }
 
+//nsqd/client_v2.go文件，保存每个客户端的连接信息。
+//clientV2实例由protocolV2.IOLoop()创建，每个连接均有一个独立的实例。
 type clientV2 struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
 	ReadyCount    int64

@@ -20,6 +20,7 @@ func TCPServer(listener net.Listener, handler TCPHandler, logf lg.AppLogFunc) er
 	var wg sync.WaitGroup
 
 	for {
+		// 等待生产者或消费者连接
 		clientConn, err := listener.Accept()
 		if err != nil {
 			if nerr, ok := err.(net.Error); ok && nerr.Temporary() {
@@ -33,9 +34,10 @@ func TCPServer(listener net.Listener, handler TCPHandler, logf lg.AppLogFunc) er
 			}
 			break
 		}
-
+		// 每创建一个连接wg +1
 		wg.Add(1)
 		go func() {
+			// 每个连接均启动一个独立的协程来接收处理请求
 			handler.Handle(clientConn)
 			wg.Done()
 		}()

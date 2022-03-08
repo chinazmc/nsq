@@ -75,6 +75,9 @@ func connectCallback(n *NSQD, hostname string) func(*lookupPeer) {
 	}
 }
 
+/*
+	lookupLoop()方法与nsqlookupd建立连接，负责向nsqlookupd注册topic，并定时发送心跳包
+*/
 func (n *NSQD) lookupLoop() {
 	var lookupPeers []*lookupPeer
 	var lookupAddrs []string

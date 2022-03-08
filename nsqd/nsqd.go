@@ -39,14 +39,14 @@ type errStore struct {
 
 type NSQD struct {
 	// 64bit atomic vars need to be first for proper alignment on 32bit platforms
-	clientIDSequence int64
+	clientIDSequence int64 // 递增的客户端ID，每个客户端连接均从这里取一个递增后的ID作为唯一标识
 
 	sync.RWMutex
 	ctx context.Context
 	// ctxCancel cancels a context that main() is waiting on
 	ctxCancel context.CancelFunc
 
-	opts atomic.Value
+	opts atomic.Value // 参数选项，真实类型是apps/nsqd/option.go:Options结构体
 
 	dl        *dirlock.DirLock
 	isLoading int32
@@ -54,7 +54,7 @@ type NSQD struct {
 	errValue  atomic.Value
 	startTime time.Time
 
-	topicMap map[string]*Topic
+	topicMap map[string]*Topic // 保存当前所有的topic
 
 	lookupPeers atomic.Value
 
@@ -64,7 +64,7 @@ type NSQD struct {
 	httpsListener net.Listener
 	tlsConfig     *tls.Config
 
-	poolSize int
+	poolSize int // 当前工作协程组的协程数量
 
 	notifyChan           chan interface{}
 	optsNotificationChan chan struct{}
@@ -238,6 +238,12 @@ func (n *NSQD) GetStartTime() time.Time {
 	return n.startTime
 }
 
+/*
+	程序启动时调用本方法，执行下面的动作：
+		- 启动TCP/HTTP/HTTPS服务
+		- 启动工作协程组：NSQD.queueScanLoop
+		- 启动服务注册：NSQD.lookupLoop
+*/
 func (n *NSQD) Main() error {
 	exitCh := make(chan error)
 	var once sync.Once
@@ -249,7 +255,7 @@ func (n *NSQD) Main() error {
 			exitCh <- err
 		})
 	}
-
+	//c. 初始化 tcpServer, httpServer, httpsServer，然后循环监控队列信息（ n.queueScanLoop ）、节点信息管理（ n.lookupLoop ）、统计信息（ n.statsdLoop ）输出；
 	n.waitGroup.Wrap(func() {
 		exitFunc(protocol.TCPServer(n.tcpListener, n.tcpServer, n.logf))
 	})
@@ -591,21 +597,22 @@ func (n *NSQD) channels() []*Channel {
 //
 // 	1 <= pool <= min(num * 0.25, QueueScanWorkerPoolMax)
 //
+// 由queueScanLoop()调用，负责启动工作协程组并动态调整协程数量。工作协程的数量为当前的channel数 * 0.25
 func (n *NSQD) resizePool(num int, workCh chan *Channel, responseCh chan bool, closeCh chan int) {
-	idealPoolSize := int(float64(num) * 0.25)
+	idealPoolSize := int(float64(num) * 0.25) // 协程数量设定为channel数的1/4
 	if idealPoolSize < 1 {
 		idealPoolSize = 1
 	} else if idealPoolSize > n.getOpts().QueueScanWorkerPoolMax {
 		idealPoolSize = n.getOpts().QueueScanWorkerPoolMax
 	}
 	for {
-		if idealPoolSize == n.poolSize {
+		if idealPoolSize == n.poolSize { // 当协程数量达到协程数量设定为channel数的1/4时，退出
 			break
-		} else if idealPoolSize < n.poolSize {
+		} else if idealPoolSize < n.poolSize { // 否则如果当前协程数大于目标值，则通过closeCh通知部分协程退出
 			// contract
 			closeCh <- 1
 			n.poolSize--
-		} else {
+		} else { // 否则协程数不够，则启动新的协程
 			// expand
 			n.waitGroup.Wrap(func() {
 				n.queueScanWorker(workCh, responseCh, closeCh)
@@ -615,8 +622,13 @@ func (n *NSQD) resizePool(num int, workCh chan *Channel, responseCh chan bool, c
 	}
 }
 
+// 这是具体的工作协程，监听workCh，对收到的待处理Channel做两个动作，一是将超时的消息重新入队；二是将到时间的延时消息入队
 // queueScanWorker receives work (in the form of a channel) from queueScanLoop
 // and processes the deferred and in-flight queues
+/**
+queueScanWorker()方法的代码很短，一是监听closeCh的退出信号；二是监听workCh的工作信号。
+workCh会将需要处理的channel传入，然后调用processInFlightQueue()清理超时的消息，调用processDeferredQueue()清理到时间的延时消息
+*/
 func (n *NSQD) queueScanWorker(workCh chan *Channel, responseCh chan bool, closeCh chan int) {
 	for {
 		select {
@@ -649,6 +661,13 @@ func (n *NSQD) queueScanWorker(workCh chan *Channel, responseCh chan bool, close
 //
 // If QueueScanDirtyPercent (default: 25%) of the selected channels were dirty,
 // the loop continues without sleep.
+// 负责管理工作协程组的数量，每调用一次NSQD.queueScanWorker()方法启动一个工作协程
+//超时逻辑由程序启动时开启的工作线程组来处理
+/**
+NSQD.queueScanLoop()方法主要有一个for循环，内层是一个select和一个loop循环。
+select中，第1个定时器case <-workTicker.C的作用是定时触发工作，只有这个case会跳出select走到下面的loop。
+第2个定时器负责启动工作协程组并动态调整协程数量
+*/
 func (n *NSQD) queueScanLoop() {
 	workCh := make(chan *Channel, n.getOpts().QueueScanSelectionCount)
 	responseCh := make(chan bool, n.getOpts().QueueScanSelectionCount)
@@ -662,11 +681,11 @@ func (n *NSQD) queueScanLoop() {
 
 	for {
 		select {
-		case <-workTicker.C:
+		case <-workTicker.C: // 定时触发工作
 			if len(channels) == 0 {
 				continue
 			}
-		case <-refreshTicker.C:
+		case <-refreshTicker.C: // 动态调整协程组的数量
 			channels = n.channels()
 			n.resizePool(len(channels), workCh, responseCh, closeCh)
 			continue
@@ -681,7 +700,7 @@ func (n *NSQD) queueScanLoop() {
 
 	loop:
 		for _, i := range util.UniqRands(num, len(channels)) {
-			workCh <- channels[i]
+			workCh <- channels[i] // 触发协程组工作
 		}
 
 		numDirty := 0
